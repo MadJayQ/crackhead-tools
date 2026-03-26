@@ -21,8 +21,17 @@ impl GpuContext {
     pub async fn new(window: Arc<Window>) -> Result<Self> {
         let size = window.inner_size();
 
+        // Use VALIDATION | DIRECTX_DEBUG_LAYER only; omit GPU_BASED_VALIDATION
+        // which triggers a spurious "pEnabledValidationFeatures[0] (4) out of range"
+        // Vulkan validation layer warning on older SDK versions.
+        #[cfg(debug_assertions)]
+        let instance_flags = wgpu::InstanceFlags::VALIDATION | wgpu::InstanceFlags::DEBUG;
+        #[cfg(not(debug_assertions))]
+        let instance_flags = wgpu::InstanceFlags::empty();
+
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
+            flags:    instance_flags,
             ..Default::default()
         });
 
