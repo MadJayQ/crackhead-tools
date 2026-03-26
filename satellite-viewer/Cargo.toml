@@ -4,42 +4,40 @@ version = "0.1.0"
 edition = "2021"
 description = "Cross-platform satellite image viewer with NEXRAD weather radar overlay"
 
-# Desktop binary entry point
 [[bin]]
 name = "satellite-viewer"
 path = "src/main.rs"
 
-# Library target — used as a C-callable entry point on iOS
 [lib]
 name = "satellite_viewer"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
-# ── UI ─────────────────────────────────────────────────────────────────────────
-# eframe bundles egui + winit + a rendering backend.
-# The "wgpu" backend gives us Metal on iOS and DX12/Vulkan on Windows
-# without platform-specific code in our crate.
-eframe = { version = "0.33", default-features = false, features = [
-    "accesskit",     # Accessibility tree
-    "default_fonts", # Built-in fonts
-    "wgpu",          # GPU backend (Metal/DX12/Vulkan)
-] }
-egui = "0.33"
-egui_extras = { version = "0.33", features = ["image"] }
+# ── GPU / Windowing ────────────────────────────────────────────────────────────
+# Direct wgpu + winit instead of eframe — gives us full control over the
+# render pipeline, shaders, and draw order.
+wgpu = "27"
+winit = "0.30"
 
-# Map tile widget for egui — handles OSM XYZ tile fetching and slippy-map math
-walkers = "0.52"
+# ── egui UI layer (on top of our custom renderer) ─────────────────────────────
+egui          = "0.33"
+egui_extras   = { version = "0.33", features = ["image"] }
+egui-wgpu     = "0.33"   # egui → wgpu render pass integration
+egui-winit    = "0.33"   # egui ← winit event translation
 
-# ── Async / Networking ─────────────────────────────────────────────────────────
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = [
-    "json",
-    "stream",
-    "rustls-tls",   # Pure-Rust TLS — no OpenSSL dep, works on iOS
-] }
+# ── Vertex data helpers ────────────────────────────────────────────────────────
+bytemuck = { version = "1", features = ["derive"] }
+
+# ── Async init helper (block_on for wgpu adapter/device negotiation) ──────────
+pollster = "0.4"
+
+# ── Networking ─────────────────────────────────────────────────────────────────
+# ureq is a synchronous HTTP client with rustls built in — no tokio required.
+# HTTP requests run on worker threads in our own thread pool (src/executor.rs).
+ureq = { version = "2", features = ["json"] }
 
 # ── Serialization ──────────────────────────────────────────────────────────────
-serde = { version = "1", features = ["derive"] }
+serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # ── Image decoding ─────────────────────────────────────────────────────────────
@@ -49,24 +47,17 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 chrono = { version = "0.4", features = ["serde"] }
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
-log = "0.4"
+log    = "0.4"
 anyhow = "1"
-bytes = "1"
 
-# env_logger is only useful on desktop; iOS uses os_log / unified logging
 [target.'cfg(not(target_os = "ios"))'.dependencies]
 env_logger = "0.11"
 
-# ── Platform: iOS ──────────────────────────────────────────────────────────────
-# On iOS, expose `satellite_viewer_main` from the lib target.
-# Your Swift/ObjC AppDelegate calls it after UIApplication finishes launching.
-# See docs/ios-integration.md for Xcode project setup.
 [target.'cfg(target_os = "ios")'.dependencies]
-# (add any iOS-specific deps here — e.g. objc, core-foundation, etc.)
+# (add ios-specific deps here)
 
-# ── Build profiles ─────────────────────────────────────────────────────────────
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level     = 3
+lto           = "thin"
 codegen-units = 1
-strip = "symbols"
+strip         = "symbols"

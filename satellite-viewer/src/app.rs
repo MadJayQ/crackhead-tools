@@ -1,139 +1,229 @@
-use std::sync::mpsc;
+/// Application state — holds all data layers and drives the egui UI.
+///
+/// This struct is no longer tied to `eframe`.  It is updated from
+/// `RunningState::render()` each frame.
+
+use std::collections::HashMap;
+use std::sync::{mpsc, Arc};
+use crate::executor::Executor;
 
 use crate::data::{
-    nexrad::{NexradClient, NexradEvent},
+    nexrad::{NexradClient, NexradEvent, RadarFrameStore},
     sentinel::{SentinelClient, SentinelEvent},
+    GeoBounds, GeoImage,
 };
-use crate::ui::{
-    map_view::MapView,
-    playback::PlaybackPanel,
-    sidebar::Sidebar,
-};
+use crate::renderer::{context::GpuContext, map_pipeline::MapPipeline, viewport::MapViewport};
+use crate::ui::{playback::PlaybackPanel, sidebar::Sidebar};
 
-/// Top-level events flowing from background tasks back to the UI thread.
+// ── AppEvent ──────────────────────────────────────────────────────────────────
+
 pub enum AppEvent {
     Nexrad(NexradEvent),
     Sentinel(SentinelEvent),
 }
 
-/// Persistent application state, owned by the egui/eframe render loop.
-pub struct SatelliteViewerApp {
-    // ── Background runtime ────────────────────────────────────────────────────
-    runtime: tokio::runtime::Runtime,
-    /// Kept alive so background tasks can send events even after being spawned.
-    _event_tx: mpsc::SyncSender<AppEvent>,
-    event_rx: mpsc::Receiver<AppEvent>,
+// ── GPU image layers ──────────────────────────────────────────────────────────
 
-    // ── Data clients ──────────────────────────────────────────────────────────
-    nexrad_client: NexradClient,
-    sentinel_client: SentinelClient,
-
-    // ── UI panels ─────────────────────────────────────────────────────────────
-    map_view: MapView,
-    playback_panel: PlaybackPanel,
-    sidebar: Sidebar,
-
-    // ── Window state ──────────────────────────────────────────────────────────
-    show_sidebar: bool,
+/// Holds decoded pixel data + lazily-uploaded wgpu bind groups for the
+/// Sentinel-2 tile overlay.
+pub struct SentinelGpuLayer {
+    pub visible: bool,
+    pub opacity: f32,
+    pub scene_id:       Option<String>,
+    pub cloud_cover:    Option<f64>,
+    pub scene_datetime: Option<String>,
+    /// Key: (z, x, y).  Value: (geographic bounds, texture bind group).
+    pub tiles: HashMap<(u8, u32, u32), (GeoBounds, wgpu::BindGroup)>,
+    /// Decoded images waiting to be uploaded on the GPU thread.
+    pending: Vec<((u8, u32, u32), GeoImage)>,
 }
 
-impl SatelliteViewerApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Install the image loader so egui_extras can decode PNG/JPEG bytes
-        // into egui textures.
-        egui_extras::install_image_loaders(&cc.egui_ctx);
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build Tokio runtime");
-
-        // A bounded channel avoids unbounded memory growth when the network
-        // is fast but the UI is slow.
-        let (event_tx, event_rx) = mpsc::sync_channel(64);
-
-        let nexrad_client = NexradClient::new(event_tx.clone(), cc.egui_ctx.clone());
-        let sentinel_client = SentinelClient::new(event_tx.clone(), cc.egui_ctx.clone());
-
-        let map_view = MapView::new(&cc.egui_ctx);
-
+impl SentinelGpuLayer {
+    fn new() -> Self {
         Self {
-            runtime,
-            _event_tx: event_tx,
-            event_rx,
-            nexrad_client,
-            sentinel_client,
-            map_view,
-            playback_panel: PlaybackPanel::default(),
-            sidebar: Sidebar::default(),
-            show_sidebar: true,
+            visible:        true,
+            opacity:        0.8,
+            scene_id:       None,
+            cloud_cover:    None,
+            scene_datetime: None,
+            tiles:          HashMap::new(),
+            pending:        Vec::new(),
         }
     }
 
-    /// Drain the event channel and apply incoming data to the relevant panels.
-    fn process_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = self.event_rx.try_recv() {
-            match event {
-                AppEvent::Nexrad(e) => {
-                    self.map_view.radar_layer.handle_event(e, ctx);
-                    self.playback_panel
-                        .sync_from_radar(&self.map_view.radar_layer);
-                }
-                AppEvent::Sentinel(e) => {
-                    self.map_view.sentinel_layer.handle_event(e, ctx);
-                }
+    fn enqueue(&mut self, key: (u8, u32, u32), image: GeoImage) {
+        self.pending.push((key, image));
+    }
+
+    /// Upload any pending images as wgpu textures (call from the GPU thread).
+    pub fn flush(&mut self, gpu: &GpuContext, pipeline: &MapPipeline) {
+        for (key, image) in self.pending.drain(..) {
+            let (z, x, y) = key;
+            let label = format!("sentinel_{z}_{x}_{y}");
+            let texture = pipeline.upload_texture(
+                gpu, &label, &image.pixels, image.width, image.height,
+            );
+            let view = texture.create_view(&Default::default());
+            let bg = pipeline.texture_bind_group(gpu, &view);
+            self.tiles.insert(key, (image.bounds, bg));
+        }
+    }
+}
+
+/// Holds NEXRAD composite frames + lazily-uploaded wgpu bind groups.
+pub struct RadarGpuLayer {
+    pub visible: bool,
+    pub opacity: f32,
+    pub store:   RadarFrameStore,
+    /// GPU textures, keyed by frame index.
+    textures: HashMap<usize, (GeoBounds, wgpu::BindGroup)>,
+    /// Decoded images waiting for GPU upload.
+    pending: Vec<(usize, GeoImage)>,
+}
+
+impl RadarGpuLayer {
+    fn new() -> Self {
+        Self {
+            visible:  true,
+            opacity:  0.6,
+            store:    RadarFrameStore::default(),
+            textures: HashMap::new(),
+            pending:  Vec::new(),
+        }
+    }
+
+    fn handle_event(&mut self, event: NexradEvent) {
+        match event {
+            NexradEvent::FrameReady { timestamp, image } => {
+                self.store.insert(timestamp, image.clone());
+                // Enqueue the texture upload for the frame we just inserted.
+                let idx = self.store.len() - 1;
+                self.pending.push((idx, image));
+            }
+            NexradEvent::FrameError { timestamp, error } => {
+                log::debug!("NEXRAD {timestamp}: {error}");
+            }
+            NexradEvent::FetchComplete => {
+                log::info!("NEXRAD fetch done — {} frames", self.store.len());
             }
         }
     }
 
-    /// Advance the radar playback clock and request new frames when needed.
-    fn tick_playback(&mut self, ctx: &egui::Context) {
-        let Some(next_frame) = self.playback_panel.tick() else {
-            return;
-        };
-        self.map_view.radar_layer.set_frame(next_frame);
-        ctx.request_repaint();
+    /// Upload pending frames as wgpu textures (GPU thread).
+    pub fn flush(&mut self, gpu: &GpuContext, pipeline: &MapPipeline) {
+        for (idx, image) in self.pending.drain(..) {
+            let Some(frame) = self.store.frames.get(idx) else { continue };
+            let label = format!("nexrad_{}", frame.timestamp.timestamp());
+            let texture = pipeline.upload_texture(
+                gpu, &label, &image.pixels, image.width, image.height,
+            );
+            let view = texture.create_view(&Default::default());
+            let bg = pipeline.texture_bind_group(gpu, &view);
+            self.textures.insert(idx, (image.bounds, bg));
+        }
     }
 
-    /// Kick off background fetches when the viewport has moved far enough that
-    /// we need new data.
-    fn maybe_fetch_new_data(&mut self) {
-        let viewport = self.map_view.viewport();
+    /// Returns `(bounds, bind_group)` for the current frame, if available.
+    pub fn current_frame_gpu(&self) -> Option<(&GeoBounds, &wgpu::BindGroup)> {
+        self.textures
+            .get(&self.store.current_index)
+            .map(|(b, bg)| (b, bg))
+    }
 
-        // Sentinel — fetch the best available scene for the current viewport.
-        if self.sentinel_client.needs_refresh(&viewport) {
-            let client = self.sentinel_client.clone();
-            let vp = viewport.clone();
-            self.runtime.spawn(async move {
-                if let Err(e) = client.fetch_scene(vp).await {
-                    log::warn!("Sentinel fetch failed: {e}");
-                }
-            });
-        }
-
-        // NEXRAD — keep the ring-buffer of composite frames up to date.
-        if self.nexrad_client.needs_refresh() {
-            let client = self.nexrad_client.clone();
-            let range = self.playback_panel.time_range();
-            self.runtime.spawn(async move {
-                if let Err(e) = client.fetch_frames(range).await {
-                    log::warn!("NEXRAD fetch failed: {e}");
-                }
-            });
-        }
+    pub fn frames(&self) -> &[crate::data::nexrad::RadarFrame] {
+        &self.store.frames
     }
 }
 
-impl eframe::App for SatelliteViewerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 1. Pull results from background tasks.
-        self.process_events(ctx);
+// ── AppState ──────────────────────────────────────────────────────────────────
 
-        // 2. Advance playback and fetch missing data.
-        self.tick_playback(ctx);
-        self.maybe_fetch_new_data();
+pub struct AppState {
+    #[allow(dead_code)]
+    executor:         Arc<Executor>,  // kept alive to drive data-fetch workers
+    _event_tx:        mpsc::SyncSender<AppEvent>,
+    event_rx:         mpsc::Receiver<AppEvent>,
+    nexrad_client:    NexradClient,
+    sentinel_client:  SentinelClient,
 
-        // 3. Top menu bar.
+    pub sentinel_layer: SentinelGpuLayer,
+    pub radar_layer:    RadarGpuLayer,
+
+    playback:   PlaybackPanel,
+    sidebar:    Sidebar,
+    show_sidebar: bool,
+}
+
+impl AppState {
+    pub fn new(
+        egui_ctx: egui::Context,
+        executor: Arc<Executor>,
+    ) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<AppEvent>(64);
+
+        let nexrad_client   = NexradClient::new(tx.clone(), egui_ctx.clone());
+        let sentinel_client = SentinelClient::new(tx.clone(), egui_ctx.clone());
+
+        Self {
+            executor,
+            _event_tx: tx,
+            event_rx: rx,
+            nexrad_client,
+            sentinel_client,
+            sentinel_layer: SentinelGpuLayer::new(),
+            radar_layer:    RadarGpuLayer::new(),
+            playback:       PlaybackPanel::default(),
+            sidebar:        Sidebar::default(),
+            show_sidebar:   true,
+        }
+    }
+
+    // ── Events ────────────────────────────────────────────────────────────────
+
+    /// Drain the event channel and upload ready images.
+    pub fn process_events(&mut self, gpu: &GpuContext, pipeline: &MapPipeline) {
+        while let Ok(event) = self.event_rx.try_recv() {
+            match event {
+                AppEvent::Nexrad(e) => self.radar_layer.handle_event(e),
+                AppEvent::Sentinel(e) => match e {
+                    SentinelEvent::SceneFound {
+                        scene_id, cloud_cover, datetime, ..
+                    } => {
+                        self.sentinel_layer.scene_id       = Some(scene_id);
+                        self.sentinel_layer.cloud_cover    = Some(cloud_cover);
+                        self.sentinel_layer.scene_datetime = Some(datetime);
+                        self.sentinel_layer.tiles.clear();
+                    }
+                    SentinelEvent::TileReady { z, x, y, image } => {
+                        self.sentinel_layer.enqueue((z, x, y), image);
+                    }
+                    SentinelEvent::Error(e) => log::warn!("Sentinel: {e}"),
+                },
+            }
+        }
+        self.sentinel_layer.flush(gpu, pipeline);
+        self.radar_layer.flush(gpu, pipeline);
+    }
+
+    // ── Data fetching ─────────────────────────────────────────────────────────
+
+    pub fn maybe_fetch(&self, viewport: &MapViewport) {
+        let data_vp = viewport.as_data_viewport();
+
+        if self.sentinel_client.needs_refresh(&data_vp) {
+            self.sentinel_client.fetch_scene(data_vp);
+        }
+
+        if self.nexrad_client.needs_refresh() {
+            let range = self.playback.time_range();
+            self.nexrad_client.fetch_frames(range);
+        }
+    }
+
+    // ── UI ────────────────────────────────────────────────────────────────────
+
+    /// Draw the egui UI for this frame.
+    pub fn show_ui(&mut self, ctx: &egui::Context, viewport: &mut MapViewport) {
+        // Top menu bar.
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -144,63 +234,71 @@ impl eframe::App for SatelliteViewerApp {
                 ui.menu_button("View", |ui| {
                     ui.checkbox(&mut self.show_sidebar, "Settings panel");
                     ui.separator();
-                    ui.checkbox(
-                        &mut self.map_view.sentinel_layer.visible,
-                        "Sentinel-2 overlay",
-                    );
-                    ui.checkbox(
-                        &mut self.map_view.radar_layer.visible,
-                        "NEXRAD radar overlay",
-                    );
+                    ui.checkbox(&mut self.sentinel_layer.visible, "Sentinel-2 overlay");
+                    ui.checkbox(&mut self.radar_layer.visible, "NEXRAD radar overlay");
                 });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("About").clicked() {
-                        // TODO: open about window
-                    }
-                });
-
-                // Right-aligned status indicator.
+                // Right-aligned spinner.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.nexrad_client.is_fetching() {
-                        ui.spinner();
-                        ui.label("Fetching radar…");
+                        ui.spinner(); ui.label("Fetching radar…");
                     } else if self.sentinel_client.is_fetching() {
-                        ui.spinner();
-                        ui.label("Fetching satellite…");
+                        ui.spinner(); ui.label("Fetching satellite…");
                     }
                 });
             });
         });
 
-        // 4. Radar playback bar — docked to the bottom.
+        // Playback bar at the bottom.
         egui::TopBottomPanel::bottom("playback_bar")
             .resizable(false)
             .min_height(80.0)
             .show(ctx, |ui| {
-                self.playback_panel.show(ui, &mut self.map_view.radar_layer);
+                self.playback.show(ui, &mut self.radar_layer);
             });
 
-        // 5. Settings sidebar — docked to the right.
+        // Settings sidebar.
         if self.show_sidebar {
             egui::SidePanel::right("sidebar")
-                .resizable(true)
                 .default_width(280.0)
                 .show(ctx, |ui| {
                     self.sidebar.show(
                         ui,
-                        &mut self.map_view,
-                        &mut self.playback_panel,
+                        &mut self.sentinel_layer,
+                        &mut self.radar_layer,
+                        &mut self.playback,
                         &self.nexrad_client,
                         &self.sentinel_client,
                     );
                 });
         }
 
-        // 6. Central map view — fills whatever space remains.
+        // Map coordinate display (bottom-left overlay on the central area).
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| {
-                self.map_view.show(ui);
+                // The map itself is rendered by our wgpu pipeline, not egui.
+                // We only overlay the coordinate readout here.
+                let rect = ui.available_rect_before_wrap();
+                let painter = ui.painter_at(rect);
+                let coord_text = format!(
+                    "{:.4}°N  {:.4}°E  z{:.1}",
+                    viewport.center_lat, viewport.center_lon, viewport.zoom
+                );
+                painter.text(
+                    rect.left_bottom() + egui::vec2(8.0, -8.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    coord_text,
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
+                );
+                // Attribution.
+                painter.text(
+                    rect.right_bottom() + egui::vec2(-8.0, -8.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    "© OpenStreetMap contributors",
+                    egui::FontId::proportional(11.0),
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180),
+                );
             });
     }
 }

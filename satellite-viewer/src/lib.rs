@@ -1,30 +1,21 @@
-// Re-export modules so both the desktop binary and the iOS staticlib can
-// reach the same types.
-
 pub mod app;
+pub mod executor;
 pub mod data;
+pub mod renderer;
 pub mod ui;
 
-// ── iOS entry point ────────────────────────────────────────────────────────────
-// Your Swift/ObjC AppDelegate calls this after the UIWindow is ready.
-// Compile with: cargo build --target aarch64-apple-ios --release
-//
-// Xcode setup:
-//   1. Add the .a file produced in target/aarch64-apple-ios/release/ to
-//      your Xcode project's "Link Binary With Libraries" build phase.
-//   2. In your AppDelegate: extern "C" { fn satellite_viewer_main(); }
-//      and call it from applicationDidFinishLaunching.
+/// iOS entry point.
+/// Called by the Swift AppDelegate after `UIApplication` finishes launching.
+/// Build: `cargo build --target aarch64-apple-ios --release`
 #[cfg(target_os = "ios")]
 #[no_mangle]
 pub extern "C" fn satellite_viewer_main() {
-    let native_options = eframe::NativeOptions {
-        renderer: eframe::Renderer::Wgpu,
-        ..Default::default()
-    };
-    eframe::run_native(
-        "Satellite Viewer",
-        native_options,
-        Box::new(|cc| Ok(Box::new(app::SatelliteViewerApp::new(cc)))),
-    )
-    .expect("failed to start eframe on iOS");
+    use std::sync::Arc;
+    use winit::{application::ApplicationHandler, event_loop::EventLoop};
+
+    // Reuse the same ApplicationHandler from main.rs.
+    // On iOS, winit drives the run loop via UIKit.
+    let event_loop = EventLoop::new().expect("create event loop");
+    let mut handler = crate::main_handler::AppHandler::default();
+    event_loop.run_app(&mut handler).expect("run app");
 }
